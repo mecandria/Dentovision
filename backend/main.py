@@ -1,3 +1,5 @@
+import json
+
 import cv2
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,23 +66,72 @@ def video_feed(camera_index: int):
 # --- WebRTC Signaling Manager for Voice/Video Call ---
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: set[WebSocket] = set()
+        self.rooms: dict[str, set[WebSocket]] = {}
+        self.socket_rooms: dict[WebSocket, str] = {}
+        self.socket_roles: dict[WebSocket, str] = {}
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections.add(websocket)
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    async def join(self, websocket: WebSocket, room_id: str, role: str):
+        if role not in {"junior", "senior"}:
+            await websocket.close(code=1008, reason="Unsupported doctor role")
+            return
 
-    async def broadcast(self, message: str, sender: WebSocket):
-        for connection in self.active_connections:
-            if connection != sender:
-                try:
-                    await connection.send_text(message)
-                except:
-                    pass
+        existing_room = self.socket_rooms.get(websocket)
+        if existing_room and existing_room != room_id:
+            await self.leave(websocket)
+
+        peers = self.rooms.setdefault(room_id, set())
+        if any(self.socket_roles.get(peer) == role for peer in peers if peer != websocket):
+            await websocket.send_json({
+                "type": "error",
+                "roomId": room_id,
+                "message": f"A {role} doctor is already connected to this room.",
+            })
+            await websocket.close(code=1008, reason="Doctor role already connected")
+            return
+
+        self.socket_rooms[websocket] = room_id
+        self.socket_roles[websocket] = role
+        peers.add(websocket)
+        for peer in tuple(peers):
+            if peer == websocket:
+                continue
+            await peer.send_json({"type": "join", "roomId": room_id, "role": role})
+            await websocket.send_json({
+                "type": "join",
+                "roomId": room_id,
+                "role": self.socket_roles[peer],
+            })
+
+    async def broadcast(self, message: str, sender: WebSocket, room_id: str):
+        for peer in tuple(self.rooms.get(room_id, set())):
+            if peer != sender:
+                await peer.send_text(message)
+
+    async def leave(self, websocket: WebSocket):
+        room_id = self.socket_rooms.pop(websocket, None)
+        role = self.socket_roles.pop(websocket, None)
+        if room_id is None:
+            return
+
+        peers = self.rooms.get(room_id)
+        if peers is None:
+            return
+        peers.discard(websocket)
+        if not peers:
+            self.rooms.pop(room_id, None)
+            return
+
+        message = json.dumps({"type": "leave", "roomId": room_id, "role": role})
+        await self.broadcast(message, websocket, room_id)
+
+    async def disconnect(self, websocket: WebSocket):
+        await self.leave(websocket)
+        self.active_connections.discard(websocket)
 
 manager = ConnectionManager()
 
@@ -90,9 +141,38 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
-            await manager.broadcast(data, websocket)
+            try:
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                await websocket.close(code=1003, reason="Invalid signaling message")
+                break
+
+            if not isinstance(message, dict):
+                await websocket.close(code=1003, reason="Invalid signaling message")
+                break
+
+            room_id = message.get("roomId")
+            role = message.get("role")
+            if not isinstance(room_id, str) or not room_id or role not in {"junior", "senior"}:
+                await websocket.close(code=1008, reason="A room and doctor role are required")
+                break
+
+            if message.get("type") == "join":
+                await manager.join(websocket, room_id, role)
+            elif message.get("type") == "leave":
+                if manager.socket_rooms.get(websocket) != room_id or manager.socket_roles.get(websocket) != role:
+                    await websocket.close(code=1008, reason="Room membership does not match")
+                    break
+                await manager.leave(websocket)
+            elif manager.socket_rooms.get(websocket) != room_id or manager.socket_roles.get(websocket) != role:
+                await websocket.close(code=1008, reason="Join the room before sending signaling data")
+                break
+            else:
+                await manager.broadcast(data, websocket, room_id)
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        pass
+    finally:
+        await manager.disconnect(websocket)
 
 if __name__ == "__main__":
     import uvicorn

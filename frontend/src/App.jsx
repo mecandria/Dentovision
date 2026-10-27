@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 
 const doctors = [
@@ -101,6 +101,7 @@ function StatusPill({ children, tone = 'green' }) {
 
 function App() {
   const [userRole, setUserRole] = useState('junior');
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [page, setPage] = useState('overview');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [availability, setAvailability] = useState('Available');
@@ -122,7 +123,31 @@ function App() {
   const [activeCall, setActiveCall] = useState(false);
   const [muted, setMuted] = useState(false);
   const [cameraOn, setCameraOn] = useState(true);
+  const [localCameras, setLocalCameras] = useState([]);
+  const [remoteCameras, setRemoteCameras] = useState([]);
+  const [detectedCameraCount, setDetectedCameraCount] = useState(0);
+  const [cameraInventory, setCameraInventory] = useState([]);
+  const [cameraDevicesChanged, setCameraDevicesChanged] = useState(false);
+  const [cameraErrors, setCameraErrors] = useState([]);
+  const [remoteAudioStream, setRemoteAudioStream] = useState(null);
+  const [speakerNeedsGesture, setSpeakerNeedsGesture] = useState(false);
+  const [callStatus, setCallStatus] = useState('idle');
+  const [callError, setCallError] = useState('');
   const [showDemoLogin, setShowDemoLogin] = useState(false);
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const localCamerasRef = useRef([]);
+  const remoteAudioRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const signalingSocketRef = useRef(null);
+  const remoteCameraMetadataRef = useRef(new Map());
+  const pendingIceCandidatesRef = useRef([]);
+  const isStartingCallRef = useRef(false);
+  const isEndingCallRef = useRef(false);
+  const offerCreatedRef = useRef(false);
+  const callGenerationRef = useRef(0);
 
   const displayName = userRole === 'junior' ? 'Dr. Asha Menon' : userRole === 'senior' ? 'Dr. Meera Nair' : 'Clinic Admin';
   const initials = userRole === 'junior' ? 'AM' : userRole === 'senior' ? 'MN' : 'CA';
@@ -133,10 +158,497 @@ function App() {
     window.setTimeout(() => setToast(''), 3200);
   };
 
+  useEffect(() => {
+    const audio = remoteAudioRef.current;
+    if (!audio) return undefined;
+    if (!remoteAudioStream) {
+      audio.srcObject = null;
+      setSpeakerNeedsGesture(false);
+      return undefined;
+    }
+
+    audio.srcObject = remoteAudioStream;
+    let active = true;
+    audio.play()
+      .then(() => { if (active) setSpeakerNeedsGesture(false); })
+      .catch(() => { if (active) setSpeakerNeedsGesture(true); });
+
+    return () => {
+      active = false;
+      audio.pause();
+      audio.srcObject = null;
+    };
+  }, [remoteAudioStream]);
+
+  useEffect(() => {
+    if (!activeCall || !navigator.mediaDevices?.addEventListener) return undefined;
+
+    const handleDeviceChange = () => {
+      navigator.mediaDevices.enumerateDevices()
+        .then(devices => {
+          const videoDevices = devices.filter(device => device.kind === 'videoinput');
+          const activeDeviceIds = new Set(localCamerasRef.current.map(camera => camera.deviceId).filter(Boolean));
+          setDetectedCameraCount(videoDevices.length);
+          setCameraDevicesChanged(videoDevices.some(device => !activeDeviceIds.has(device.deviceId)));
+        })
+        .catch(error => {
+          setCallError(`Could not refresh the camera list: ${error.message}`);
+        });
+    };
+
+    navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange);
+    return () => navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
+  }, [activeCall]);
+
+  const hangUpCall = () => {
+    callGenerationRef.current += 1;
+    isEndingCallRef.current = true;
+    if (signalingSocketRef.current?.readyState === WebSocket.OPEN) {
+      signalingSocketRef.current.send(JSON.stringify({
+        type: 'leave',
+        roomId: selectedRoomId,
+        role: userRole,
+      }));
+    }
+    localCamerasRef.current.forEach(camera => camera.stream.getTracks().forEach(track => track.stop()));
+    localCamerasRef.current = [];
+    setLocalCameras([]);
+    setRemoteCameras([]);
+    setDetectedCameraCount(0);
+    setCameraInventory([]);
+    setCameraDevicesChanged(false);
+    setCameraErrors([]);
+    setRemoteAudioStream(null);
+    remoteCameraMetadataRef.current.clear();
+    pendingIceCandidatesRef.current = [];
+    offerCreatedRef.current = false;
+
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+    if (signalingSocketRef.current) {
+      signalingSocketRef.current.close();
+      signalingSocketRef.current = null;
+    }
+
+    setActiveCall(false);
+    setCallStatus('idle');
+    setCallError('');
+    setMuted(false);
+    setCameraOn(true);
+    isStartingCallRef.current = false;
+  };
+
+  const createPeerConnection = (generation) => {
+    if (peerConnectionRef.current) return peerConnectionRef.current;
+
+    const peerConnection = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        ...(import.meta.env.VITE_TURN_URLS
+          ? [{
+            urls: import.meta.env.VITE_TURN_URLS.split(',').map(url => url.trim()).filter(Boolean),
+            username: import.meta.env.VITE_TURN_USERNAME,
+            credential: import.meta.env.VITE_TURN_CREDENTIAL,
+          }]
+          : []),
+      ],
+    });
+    peerConnectionRef.current = peerConnection;
+
+    localCamerasRef.current.forEach(camera => {
+      camera.stream.getTracks().forEach(track => peerConnection.addTrack(track, camera.stream));
+    });
+
+    peerConnection.ontrack = event => {
+      if (generation !== callGenerationRef.current || isEndingCallRef.current) return;
+      const stream = event.streams[0] || new MediaStream([event.track]);
+      if (event.track.kind === 'audio') {
+        setRemoteAudioStream(stream);
+        return;
+      }
+      if (event.track.kind !== 'video') return;
+      const metadata = remoteCameraMetadataRef.current.get(stream.id);
+      setRemoteCameras(current => {
+        const existingCamera = current.find(camera => camera.id === stream.id);
+        const camera = {
+          id: stream.id,
+          name: metadata?.name || existingCamera?.name || 'Remote camera',
+          stream,
+          primary: metadata?.primary ?? existingCamera?.primary ?? false,
+          active: true,
+        };
+        return [...current.filter(item => item.id !== camera.id), camera];
+      });
+    };
+
+    peerConnection.onconnectionstatechange = () => {
+      if (generation !== callGenerationRef.current || isEndingCallRef.current) return;
+      if (peerConnection.connectionState === 'connected') {
+        setCallStatus('connected');
+        setCallError('');
+      } else if (peerConnection.connectionState === 'connecting') {
+        setCallStatus('connecting');
+      } else if (peerConnection.connectionState === 'failed') {
+        setCallStatus('failed');
+        setCallError('The peer connection failed. Check both devices’ networks, configure a TURN relay if needed, then rejoin.');
+      } else if (peerConnection.connectionState === 'disconnected') {
+        setCallStatus('disconnected');
+      }
+    };
+
+    peerConnection.onicecandidate = event => {
+      if (generation === callGenerationRef.current && event.candidate && signalingSocketRef.current?.readyState === WebSocket.OPEN) {
+        signalingSocketRef.current.send(JSON.stringify({
+          type: 'ice-candidate',
+          roomId: selectedRoomId,
+          role: userRole,
+          candidate: event.candidate,
+        }));
+      }
+    };
+
+    return peerConnection;
+  };
+
+  const startCall = async () => {
+    if (isStartingCallRef.current || signalingSocketRef.current) return;
+    const generation = ++callGenerationRef.current;
+    isStartingCallRef.current = true;
+    isEndingCallRef.current = false;
+    setCallStatus('requesting');
+    setCallError('');
+    setCameraErrors([]);
+    setCameraInventory([]);
+    setCameraDevicesChanged(false);
+
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Camera and microphone access is not available in this browser. Open the secure preview URL and allow device access.');
+      }
+
+      const primaryStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      if (generation !== callGenerationRef.current || isEndingCallRef.current) {
+        primaryStream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      localCamerasRef.current = [{
+        id: primaryStream.id,
+        name: 'Default camera',
+        stream: primaryStream,
+        primary: true,
+        active: true,
+      }];
+      const videoDevices = (await navigator.mediaDevices.enumerateDevices())
+        .filter(device => device.kind === 'videoinput');
+      if (generation !== callGenerationRef.current || isEndingCallRef.current) return;
+      setDetectedCameraCount(videoDevices.length);
+      const primaryTrack = primaryStream.getVideoTracks()[0];
+      const primaryDeviceId = primaryTrack?.getSettings().deviceId;
+      const primaryDevice = videoDevices.find(device => device.deviceId === primaryDeviceId);
+      const additionalDevices = videoDevices.filter(device => device.deviceId !== primaryDeviceId);
+      const inventory = videoDevices.map(device => ({
+        id: device.deviceId,
+        name: device.deviceId === primaryDeviceId
+          ? primaryDevice?.label || primaryTrack?.label || 'Built-in camera'
+          : `USB ${additionalDevices.findIndex(item => item.deviceId === device.deviceId) + 1}${device.label ? ` · ${device.label}` : ''}`,
+        status: device.deviceId === primaryDeviceId ? 'Live' : 'Opening…',
+      }));
+      setCameraInventory(inventory);
+      const cameras = [{
+        id: primaryStream.id,
+        name: primaryDevice?.label || 'Default camera',
+        deviceId: primaryDeviceId,
+        stream: primaryStream,
+        primary: true,
+        active: true,
+      }];
+
+      const cameraIssues = [];
+
+      for (const [index, device] of additionalDevices.entries()) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId: { exact: device.deviceId } },
+            audio: false,
+          });
+          if (generation !== callGenerationRef.current || isEndingCallRef.current) {
+            stream.getTracks().forEach(track => track.stop());
+            return;
+          }
+          cameras.push({
+            id: stream.id,
+            name: `USB ${index + 1}${device.label ? ` · ${device.label}` : ''}`,
+            deviceId: device.deviceId,
+            stream,
+            primary: false,
+            active: true,
+          });
+          localCamerasRef.current = cameras;
+          setLocalCameras([...cameras]);
+          setCameraInventory(current => current.map(item => item.id === device.deviceId ? { ...item, status: 'Live' } : item));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Camera access was denied.';
+          const issue = `USB ${index + 1}${device.label ? ` · ${device.label}` : ''}: ${message}`;
+          cameraIssues.push(issue);
+          setCameraInventory(current => current.map(item => item.id === device.deviceId ? { ...item, status: 'Unavailable' } : item));
+          console.warn(`Could not open additional camera "${device.label || device.deviceId}".`, error);
+        }
+      }
+
+      if (generation !== callGenerationRef.current || isEndingCallRef.current) {
+        cameras.forEach(camera => camera.stream.getTracks().forEach(track => track.stop()));
+        return;
+      }
+
+      localCamerasRef.current = cameras;
+      setLocalCameras(cameras);
+      setCameraErrors(cameraIssues);
+      setCallStatus('waiting');
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const socket = new WebSocket(`${protocol}//${window.location.host}/ws/signaling`);
+      signalingSocketRef.current = socket;
+
+      const sendSignal = message => {
+        if (socket.readyState !== WebSocket.OPEN) return false;
+        socket.send(JSON.stringify({ ...message, roomId: selectedRoomId, role: userRole }));
+        return true;
+      };
+
+      const createOffer = async () => {
+        if (generation !== callGenerationRef.current || userRole !== 'junior' || offerCreatedRef.current) return;
+        offerCreatedRef.current = true;
+        try {
+          const peerConnection = createPeerConnection(generation);
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          if (!sendSignal({
+            type: 'offer',
+            offer,
+            cameras: cameras.map(({ id, name, primary }) => ({ id, name, primary })),
+          })) {
+            throw new Error('The signaling connection closed before the call offer could be sent.');
+          }
+          setCallStatus('connecting');
+        } catch (error) {
+          if (generation !== callGenerationRef.current) return;
+          offerCreatedRef.current = false;
+          setCallStatus('failed');
+          setCallError(error.message || 'Could not start the video connection.');
+        }
+      };
+
+      socket.onopen = () => {
+        if (generation !== callGenerationRef.current) return;
+        isStartingCallRef.current = false;
+        setCallStatus('waiting');
+        sendSignal({
+          type: 'join',
+          cameras: cameras.map(({ id, name, primary }) => ({ id, name, primary })),
+        });
+      };
+
+      socket.onmessage = async event => {
+        if (generation !== callGenerationRef.current) return;
+        try {
+          const message = JSON.parse(event.data);
+          if (message.roomId !== selectedRoomId || message.role === userRole) return;
+          if (message.type === 'error') {
+            setCallStatus('failed');
+            setCallError(message.message || 'The signaling service rejected this room connection.');
+            return;
+          }
+          if (message.cameras) {
+            remoteCameraMetadataRef.current = new Map(message.cameras.map(camera => [camera.id, camera]));
+          }
+          if (message.type === 'leave') {
+            peerConnectionRef.current?.close();
+            peerConnectionRef.current = null;
+            remoteCameraMetadataRef.current.clear();
+            pendingIceCandidatesRef.current = [];
+            offerCreatedRef.current = false;
+            setRemoteCameras([]);
+            setRemoteAudioStream(null);
+            setCallStatus('disconnected');
+            setCallError('The other doctor left the call.');
+            return;
+          }
+
+          if (message.type === 'join') {
+            if (userRole === 'senior') {
+              sendSignal({
+                type: 'ready',
+                cameras: cameras.map(({ id, name, primary }) => ({ id, name, primary })),
+              });
+            } else {
+              await createOffer();
+            }
+            return;
+          }
+          if (message.type === 'ready') {
+            await createOffer();
+            return;
+          }
+
+          const peerConnection = createPeerConnection(generation);
+          if (message.type === 'offer') {
+            await peerConnection.setRemoteDescription(message.offer);
+            for (const candidate of pendingIceCandidatesRef.current) {
+              await peerConnection.addIceCandidate(candidate);
+            }
+            pendingIceCandidatesRef.current = [];
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+            sendSignal({
+              type: 'answer',
+              answer,
+              cameras: cameras.map(({ id, name, primary }) => ({ id, name, primary })),
+            });
+            setCallStatus('connecting');
+          } else if (message.type === 'answer') {
+            await peerConnection.setRemoteDescription(message.answer);
+            for (const candidate of pendingIceCandidatesRef.current) {
+              await peerConnection.addIceCandidate(candidate);
+            }
+            pendingIceCandidatesRef.current = [];
+          } else if (message.type === 'ice-candidate' && message.candidate) {
+            const candidate = new RTCIceCandidate(message.candidate);
+            if (peerConnection.remoteDescription) {
+              await peerConnection.addIceCandidate(candidate);
+            } else {
+              pendingIceCandidatesRef.current.push(candidate);
+            }
+          }
+        } catch (error) {
+          if (generation !== callGenerationRef.current) return;
+          setCallStatus('failed');
+          setCallError(error.message || 'A signaling error interrupted the call.');
+        }
+      };
+
+      socket.onerror = () => {
+        if (generation !== callGenerationRef.current) return;
+        isStartingCallRef.current = false;
+        setCallStatus('failed');
+        setCallError('Could not connect to the call signaling service. Check that the backend is running.');
+      };
+
+      socket.onclose = event => {
+        if (generation !== callGenerationRef.current) return;
+        isStartingCallRef.current = false;
+        if (!isEndingCallRef.current) {
+          setCallStatus(current => current === 'failed' ? current : 'disconnected');
+          setCallError(current => current || event.reason || 'The call signaling connection closed.');
+        }
+      };
+    } catch (error) {
+      if (generation !== callGenerationRef.current) return;
+      localCamerasRef.current.forEach(camera => camera.stream.getTracks().forEach(track => track.stop()));
+      localCamerasRef.current = [];
+      setLocalCameras([]);
+      setCallStatus('failed');
+      setCallError(error.message || 'Could not access the camera and microphone.');
+      isStartingCallRef.current = false;
+    }
+  };
+
+  const openLiveCall = () => {
+    setPage('rooms');
+    setCallError('');
+    setActiveCall(true);
+    void startCall();
+  };
+
+  const retryLiveCall = () => {
+    hangUpCall();
+    setActiveCall(true);
+    void startCall();
+  };
+
+  const toggleCamera = (cameraId) => {
+    const localCamera = localCameras.find(camera => camera.id === cameraId);
+    const camera = localCamera || remoteCameras.find(item => item.id === cameraId);
+    if (!camera) return;
+    const active = !camera.active;
+    camera.stream.getVideoTracks().forEach(track => { track.enabled = active; });
+    const updateCameras = current => current.map(item => item.id === cameraId ? { ...item, active } : item);
+    if (localCamera) {
+      setLocalCameras(updateCameras);
+      if (localCamera.primary) setCameraOn(active);
+    } else {
+      setRemoteCameras(updateCameras);
+    }
+  };
+
+  const toggleMute = () => {
+    const primaryCamera = localCamerasRef.current.find(camera => camera.primary);
+    if (!primaryCamera) return;
+    const nextMuted = !muted;
+    primaryCamera.stream.getAudioTracks().forEach(track => { track.enabled = !nextMuted; });
+    setMuted(nextMuted);
+  };
+
+  const enableRemoteAudio = () => {
+    if (!remoteAudioRef.current) return;
+    remoteAudioRef.current.play()
+      .then(() => setSpeakerNeedsGesture(false))
+      .catch(error => {
+        setSpeakerNeedsGesture(true);
+        setCallError(`Could not play the senior doctor's audio: ${error.message}`);
+      });
+  };
+
   const openPage = (nextPage) => {
+    if (activeCall) hangUpCall();
     setPage(nextPage);
     setMobileNavOpen(false);
-    setActiveCall(false);
+  };
+
+  const handleLogin = async (event) => {
+    event.preventDefault();
+    setLoginError('');
+    setIsLoggingIn(true);
+
+    try {
+      const response = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: loginUsername.trim(), password: loginPassword }),
+      });
+      const result = await response.json();
+
+      if (!response.ok) {
+        setLoginError(result.detail || 'Unable to sign in. Check your username and password.');
+        return;
+      }
+
+      if (result.role !== 'junior_doctor' && result.role !== 'senior_doctor') {
+        setLoginError('This account does not have a supported demo role.');
+        return;
+      }
+
+      setUserRole(result.role === 'junior_doctor' ? 'junior' : 'senior');
+      setPage('overview');
+      setIsAuthenticated(true);
+      setLoginPassword('');
+    } catch {
+      setLoginError('Could not connect to the demo login service. Please try again.');
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleLogout = () => {
+    hangUpCall();
+    setIsAuthenticated(false);
+    setUserRole('junior');
+    setPage('overview');
+    setShowDemoLogin(false);
+    setLoginUsername('');
+    setLoginPassword('');
+    setLoginError('');
   };
 
   const handleBooking = (event) => {
@@ -234,7 +746,7 @@ function App() {
               <div><span className={`check-circle${selectedRoom.consent ? '' : ' check-pending'}`}>{selectedRoom.consent ? <Icon name="check" size={12} /> : '!'}</span><span><b>Patient consent</b><small>{selectedRoom.consent ? 'Recorded before consultation' : 'Required before starting'}</small></span><b className="check-state">{selectedRoom.consent ? 'Confirmed' : 'Required'}</b></div>
               <div><span className="check-circle"><Icon name="camera" size={12} /></span><span><b>Cameras & microphone</b><small>Check devices before joining the call</small></span><button className="text-button" onClick={() => notify('Device check is a wireframe preview. Camera hardware will be tested before a live call.')}>Check devices</button></div>
             </div>
-            <div className="room-detail-footer"><span><Icon name="shield" size={15} /> Room activity and playback access are audited.</span><button className="button button-primary" disabled={selectedRoom.status !== 'Ready to join' || !selectedRoom.consent} onClick={() => { setActiveCall(true); setPage('rooms'); }}><Icon name="video" /> Join private session</button></div>
+            <div className="room-detail-footer"><span><Icon name="shield" size={15} /> Room activity and playback access are audited.</span><button className="button button-primary" disabled={selectedRoom.status !== 'Ready to join' || !selectedRoom.consent} onClick={openLiveCall}><Icon name="video" /> Join private session</button></div>
           </section>}
         </div>
       </>
@@ -267,7 +779,7 @@ function App() {
           </div>
           <div className="schedule-list">
             <ScheduleItem time="09:00" period="AM" patient="Case #D-2048" detail="Endodontic review" doctor="Dr. Meera Nair" initials="MN" color="mint" state="Completed" />
-            <ScheduleItem time="10:30" period="AM" patient="Case #D-2052" detail="Post-op follow-up" doctor="Dr. Arjun Patel" initials="AP" color="lilac" state="In 15 min" highlighted onJoin={() => setActiveCall(true)} />
+            <ScheduleItem time="10:30" period="AM" patient="Case #D-2052" detail="Post-op follow-up" doctor="Dr. Arjun Patel" initials="AP" color="lilac" state="In 15 min" highlighted onJoin={openLiveCall} />
             <ScheduleItem time="11:30" period="AM" patient="Case #D-2054" detail="Dental pain assessment" doctor="Dr. Samuel Thomas" initials="ST" color="blue" state="Upcoming" />
           </div>
         </section>
@@ -449,28 +961,114 @@ function App() {
     </>
   );
 
-  const renderCall = () => (
-    <div className="call-page">
-      <div className="call-topline"><button className="text-button" onClick={() => { setActiveCall(false); setPage('overview'); }}>← Back to dashboard</button><span className="call-encrypted"><Icon name="shield" size={15} /> Secure consultation</span></div>
-      <div className="call-title"><div><StatusPill tone="red">Recording · {muted ? '00:18' : '00:12'} / 30:00</StatusPill><h1>Private consultation</h1><p>Case #D-2058 · Endodontic review · Started 9:12 AM</p></div><button className="button button-danger" onClick={() => { setActiveCall(false); notify('Consultation ended. Session summary is ready.'); setPage('history'); }}>End consultation</button></div>
-      <div className="call-layout">
-        <section className="call-main">
-          <div className="call-video-grid">
-            <div className="call-video call-video-primary"><div className="camera-placeholder"><div className="camera-symbol"><Icon name="camera" size={30} /></div><b>Intraoral camera</b><span>Live camera preview placeholder</span></div><div className="video-label"><Avatar initials="AM" color="mint" small /> Dr. Asha Menon <span>● LIVE</span></div></div>
-            <div className="call-video"><div className="camera-placeholder warm"><div className="camera-symbol"><Icon name="camera" size={26} /></div><b>Full head view</b><span>Camera 2 preview placeholder</span></div><div className="video-label">Camera 2</div></div>
-            <div className="call-video"><div className="camera-placeholder cool"><div className="camera-symbol"><Icon name="camera" size={26} /></div><b>Room view</b><span>Camera 3 preview placeholder</span></div><div className="video-label">Camera 3</div></div>
-          </div>
-          <div className="call-controls"><button className={`call-control${muted ? ' control-active' : ''}`} onClick={() => setMuted(!muted)}><Icon name={muted ? 'micOff' : 'mic'} /><span>{muted ? 'Unmute' : 'Mute'}</span></button><button className={`call-control${!cameraOn ? ' control-active' : ''}`} onClick={() => setCameraOn(!cameraOn)}><Icon name="camera" /><span>{cameraOn ? 'Camera on' : 'Camera off'}</span></button><button className="call-control" onClick={() => notify('Screen sharing is a wireframe control.')}><Icon name="grid" /><span>Layout</span></button><button className="call-control" onClick={() => notify('Recording is limited to 30 minutes for this pilot.')}><Icon name="video" /><span>Recording</span></button></div>
-          <div className="connection-note"><span className="signal-bars"><i /><i /><i /><i /></span><span>Connection is stable</span><span>·</span><span>720p</span><span className="spacer" /><span>Recording stops at 30 min. The call can continue.</span></div>
-        </section>
-        <aside className="call-sidebar">
-          <div className="panel participants-panel"><div className="panel-heading"><div><h2>Participants <span className="count-badge">3</span></h2><p>Only invited doctors can join</p></div><button className="icon-button subtle" onClick={() => notify('Only the junior doctor can invite a participant in this wireframe.')}><Icon name="plus" /></button></div><Participant initials="AM" name="Dr. Asha Menon" label="Junior doctor · You" color="mint" /><Participant initials="MN" name="Dr. Meera Nair" label="Senior doctor" color="lilac" /><Participant initials="AP" name="Dr. Arjun Patel" label="Senior doctor" color="peach" /></div>
-          <div className="panel call-notes"><div className="panel-heading"><div><h2>Session notes</h2><p>Visible to participants</p></div><button className="text-button" onClick={() => notify('Notes are a wireframe preview; saving will be connected to the API.')}>Save</button></div><textarea placeholder="Add clinical notes for this consultation…" /><div className="notes-ai"><span>✦</span> AI draft notes can be reviewed after the call.</div></div>
-          <div className="patient-summary"><span>CASE REFERENCE</span><b>Case #D-2058</b><small>Consent confirmed · Recording enabled</small><button className="text-button">View case details <Icon name="chevron" size={14} /></button></div>
-        </aside>
+  const renderCall = () => {
+    const callRoom = rooms.find(room => room.id === selectedRoomId) || rooms[0];
+    const statusLabels = {
+      requesting: 'Requesting camera and microphone access',
+      waiting: `Waiting for ${userRole === 'junior' ? 'senior' : 'junior'} doctor`,
+      connecting: 'Connecting live audio and video',
+      connected: 'Live connection active',
+      disconnected: 'Connection interrupted',
+      failed: 'Connection failed',
+    };
+    const remoteName = userRole === 'junior' ? 'Dr. Meera Nair' : 'Dr. Asha Menon';
+    const remoteInitials = userRole === 'junior' ? 'MN' : 'AM';
+    const cameras = [
+      ...localCameras.map(camera => ({ ...camera, local: true })),
+      ...remoteCameras.map(camera => ({ ...camera, local: false })),
+    ];
+
+    return (
+      <div className="call-page">
+        <div className="call-topline"><button className="text-button" onClick={() => openPage('overview')}>← Back to dashboard</button><span className="call-encrypted"><Icon name="shield" size={15} /> Live consultation</span></div>
+        <div className="call-title">
+        <div><StatusPill tone={callStatus === 'connected' ? 'green' : callStatus === 'failed' || callStatus === 'disconnected' ? 'red' : 'amber'}>{statusLabels[callStatus] || 'Starting call'}</StatusPill><h1>Private consultation</h1><p>{callRoom.caseRef} · {callRoom.reason}</p></div>
+          <button className="button button-danger" onClick={() => { hangUpCall(); setPage('history'); }}>End consultation</button>
+        </div>
+        <div className="call-layout">
+          <section className="call-main">
+            <audio ref={remoteAudioRef} className="remote-audio-output" autoPlay playsInline />
+            <div className="call-video-grid">
+              {cameras.map(camera => <MediaTile key={camera.id} camera={camera} onToggle={toggleCamera} />)}
+              {remoteCameras.length === 0 && <div className="call-video call-waiting-tile"><div className="camera-placeholder"><div className="camera-symbol"><Icon name="video" size={26} /></div><b>{callStatus === 'connected' ? 'Waiting for remote camera' : `Waiting for ${userRole === 'junior' ? 'senior' : 'junior'} doctor`}</b><span>The other participant needs to sign in and join this room.</span></div></div>}
+              {cameras.length === 0 && <div className="call-video"><div className="camera-placeholder"><div className="camera-symbol"><Icon name="camera" size={26} /></div><b>Camera preview will appear here</b><span>Allow camera and microphone access when your browser asks.</span></div></div>}
+            </div>
+            <div className="camera-count-note">
+              Cameras detected on this device: {detectedCameraCount} · Active: {localCameras.length} · Other doctor cameras: {remoteCameras.length}
+            </div>
+            <section className="camera-inventory" aria-label="Camera device status">
+              <div><b>Camera devices on this device</b><button className="text-button" onClick={retryLiveCall}>Re-scan USB cameras</button></div>
+              {cameraInventory.length > 0
+                ? <ul>{cameraInventory.map(device => <li key={device.id}><span>{device.name}</span><b className={device.status === 'Live' ? 'camera-device-live' : ''}>{device.status}</b></li>)}</ul>
+                : <p>No camera devices were reported by this browser. Check USB connection and browser permissions.</p>}
+              {cameraDevicesChanged && <small>A camera was connected after the call started. Re-scan to add it to the call.</small>}
+            </section>
+            {cameraErrors.length > 0 && <div className="call-error camera-error-list" role="alert">
+              <div><b>Some USB cameras could not be opened</b><ul>{cameraErrors.map(error => <li key={error}>{error}</li>)}</ul><span>Check browser camera permissions and that each camera is not in use by another app.</span></div>
+              <button className="button button-secondary button-sm" onClick={retryLiveCall}>Retry cameras</button>
+            </div>}
+            <div className="call-controls">
+              <button className={`call-control${muted ? ' control-active' : ''}`} onClick={toggleMute} disabled={!localCameras.length}><Icon name={muted ? 'micOff' : 'mic'} /><span>{muted ? 'Unmute mic' : 'Mute mic'}</span></button>
+              <button className={`call-control${!cameraOn ? ' control-active' : ''}`} onClick={() => { const primaryCamera = localCameras.find(camera => camera.primary); if (primaryCamera) toggleCamera(primaryCamera.id); }} disabled={!localCameras.length}><Icon name="camera" /><span>{cameraOn ? 'Camera on' : 'Camera off'}</span></button>
+              <button className="call-control" onClick={enableRemoteAudio} disabled={!remoteAudioStream}><span>{speakerNeedsGesture ? 'Enable speaker' : remoteAudioStream ? 'Speaker on' : 'Waiting for audio'}</span></button>
+            </div>
+            {callError && <div className="call-error" role="alert"><span>{callError}</span><button className="button button-secondary button-sm" onClick={retryLiveCall}>Retry connection</button></div>}
+            <div className="connection-note"><span className={`connection-indicator${callStatus === 'connected' ? ' connection-live' : ''}`} /><span>{statusLabels[callStatus] || 'Starting call'}</span><span className="spacer" /><span>Allow camera and microphone access for live audio and video.</span></div>
+          </section>
+          <aside className="call-sidebar">
+            <div className="panel participants-panel"><div className="panel-heading"><div><h2>Participants <span className="count-badge">2</span></h2><p>Join from the junior and senior doctor accounts</p></div></div><Participant initials={initials} name={displayName} label={`${userRole === 'junior' ? 'Junior' : 'Senior'} doctor · You`} color={userRole === 'junior' ? 'mint' : 'lilac'} /><Participant initials={remoteInitials} name={remoteName} label={callStatus === 'connected' ? 'Connected' : 'Waiting to join'} color={userRole === 'junior' ? 'lilac' : 'mint'} /></div>
+            <div className="patient-summary"><span>CASE REFERENCE</span><b>{callRoom.caseRef}</b><small>{callRoom.reason}</small></div>
+          </aside>
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
+
+  if (!isAuthenticated) {
+    return (
+      <main className="login-screen">
+        <div className="login-brand">
+          <span className="brand-mark"><span>+</span></span>
+          <span className="brand-name">dento<span>vision</span><small>CARE CONNECTED</small></span>
+        </div>
+        <section className="login-card panel">
+          <div className="eyebrow">WIREFRAME DEMO</div>
+          <h1>Sign in to Dentovision</h1>
+          <p className="login-intro">Explore the consultation workspace with a demo account.</p>
+          <form onSubmit={handleLogin}>
+            <label className="login-field">
+              <span>Username</span>
+              <input autoComplete="username" value={loginUsername} onChange={event => setLoginUsername(event.target.value)} required />
+            </label>
+            <label className="login-field">
+              <span>Password</span>
+              <input type="password" autoComplete="current-password" value={loginPassword} onChange={event => setLoginPassword(event.target.value)} required />
+            </label>
+            {loginError && <p className="login-error" role="alert">{loginError}</p>}
+            <button className="button button-primary login-submit" type="submit" disabled={isLoggingIn}>
+              {isLoggingIn ? 'Signing in…' : 'Sign in to demo'}
+            </button>
+          </form>
+          <div className="login-demo-accounts">
+            <div className="login-demo-heading">Choose a demo account</div>
+            <div className="login-demo-options">
+              <button type="button" onClick={() => { setLoginUsername('junior'); setLoginPassword('password123'); setLoginError(''); }}>
+                <Avatar initials="AM" color="mint" small />
+                <span><b>Junior doctor</b><small>Username: junior</small></span>
+              </button>
+              <button type="button" onClick={() => { setLoginUsername('senior'); setLoginPassword('password123'); setLoginError(''); }}>
+                <Avatar initials="MN" color="lilac" small />
+                <span><b>Senior doctor</b><small>Username: senior</small></span>
+              </button>
+            </div>
+            <p>Demo password: <code>password123</code></p>
+          </div>
+          <div className="demo-login-note"><Icon name="shield" size={15} /> Prototype only — use demo data, not real patient information.</div>
+        </section>
+        <p className="login-footer">Dentovision · Care connected</p>
+      </main>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -500,7 +1098,7 @@ function App() {
         </div>
       </main>
       {toast && <div className="toast-message"><span><Icon name="check" size={16} /></span>{toast}</div>}
-      {showDemoLogin && <div className="modal-backdrop" onClick={() => setShowDemoLogin(false)}><div className="demo-modal panel" onClick={event => event.stopPropagation()}><button className="modal-close icon-button" onClick={() => setShowDemoLogin(false)} aria-label="Close"><Icon name="close" /></button><div className="eyebrow">PROTOTYPE PREVIEW</div><h2>Switch your workspace view</h2><p>This wireframe uses demo data only. Select a role to preview the experience.</p><div className="role-options"><button onClick={() => { setUserRole('junior'); setShowDemoLogin(false); }}><Avatar initials="AM" color="mint" /><span><b>Junior doctor</b><small>Book, join and review consultations</small></span><Icon name="chevron" /></button><button onClick={() => { setUserRole('senior'); setShowDemoLogin(false); }}><Avatar initials="MN" color="lilac" /><span><b>Senior doctor</b><small>Manage availability and review sessions</small></span><Icon name="chevron" /></button><button onClick={() => { setUserRole('admin'); setPage('enrollment'); setShowDemoLogin(false); }}><Avatar initials="CA" color="peach" /><span><b>Clinic administrator</b><small>Approve doctor enrollment requests</small></span><Icon name="chevron" /></button></div><div className="demo-login-note"><Icon name="shield" size={15} /> No credentials or patient data are saved in this preview.</div></div></div>}
+      {showDemoLogin && <div className="modal-backdrop" onClick={() => setShowDemoLogin(false)}><div className="demo-modal panel" onClick={event => event.stopPropagation()}><button className="modal-close icon-button" onClick={() => setShowDemoLogin(false)} aria-label="Close"><Icon name="close" /></button><div className="eyebrow">PROTOTYPE PREVIEW</div><h2>Switch your workspace view</h2><p>This wireframe uses demo data only. Select a role to preview the experience.</p><div className="role-options"><button onClick={() => { setUserRole('junior'); setShowDemoLogin(false); }}><Avatar initials="AM" color="mint" /><span><b>Junior doctor</b><small>Book, join and review consultations</small></span><Icon name="chevron" /></button><button onClick={() => { setUserRole('senior'); setShowDemoLogin(false); }}><Avatar initials="MN" color="lilac" /><span><b>Senior doctor</b><small>Manage availability and review sessions</small></span><Icon name="chevron" /></button><button onClick={() => { setUserRole('admin'); setPage('enrollment'); setShowDemoLogin(false); }}><Avatar initials="CA" color="peach" /><span><b>Clinic administrator</b><small>Approve doctor enrollment requests</small></span><Icon name="chevron" /></button></div><div className="demo-login-note"><Icon name="shield" size={15} /> No credentials or patient data are saved in this preview.</div><button className="button button-secondary button-full" onClick={handleLogout}>Sign out</button></div></div>}
     </div>
   );
 }
@@ -511,7 +1109,7 @@ function StatCard({ label, value, suffix, change, icon, tone }) {
 }
 
 function ScheduleItem({ time, period, patient, detail, doctor, initials, color, state, highlighted, onJoin }) {
-  return <div className={`schedule-item${highlighted ? ' schedule-highlighted' : ''}`}><div className="schedule-time">{time}<small>{period}</small></div><div className="timeline-rail"><i /></div><div className="schedule-info"><div className="schedule-case"><b>{patient}</b><span className={highlighted ? 'tag-soon' : ''}>{state}</span></div><p>{detail}</p><div className="schedule-doctor"><Avatar initials={initials} color={color} small /> {doctor}</div>{onJoin && <button className="text-button join-call-button" onClick={onJoin}><Icon name="video" size={13} /> Open call preview</button>}</div><button className="icon-button subtle schedule-open" aria-label={`Open ${patient}`} onClick={onJoin}><Icon name="chevron" size={16} /></button></div>;
+  return <div className={`schedule-item${highlighted ? ' schedule-highlighted' : ''}`}><div className="schedule-time">{time}<small>{period}</small></div><div className="timeline-rail"><i /></div><div className="schedule-info"><div className="schedule-case"><b>{patient}</b><span className={highlighted ? 'tag-soon' : ''}>{state}</span></div><p>{detail}</p><div className="schedule-doctor"><Avatar initials={initials} color={color} small /> {doctor}</div>{onJoin && <button className="text-button join-call-button" onClick={onJoin}><Icon name="video" size={13} /> Join live call</button>}</div><button className="icon-button subtle schedule-open" aria-label={`Open ${patient}`} onClick={onJoin}><Icon name="chevron" size={16} /></button></div>;
 }
 
 function DoctorRow({ doctor, onBook }) {
@@ -528,6 +1126,25 @@ function Field({ label, hint, children }) {
 
 function Participant({ initials, name, label, color }) {
   return <div className="participant-row"><Avatar initials={initials} color={color} /><div><b>{name}</b><small>{label}</small></div><span className="participant-online" /></div>;
+}
+
+function MediaTile({ camera, onToggle }) {
+  return (
+    <div className={`call-video${camera.primary ? ' call-video-primary' : ''}`}>
+      <video
+        ref={element => {
+          if (element && element.srcObject !== camera.stream) element.srcObject = camera.stream;
+        }}
+        className="call-video-feed"
+        autoPlay
+        muted
+        playsInline
+      />
+      {!camera.active && <div className="call-camera-disabled">Camera disabled</div>}
+      <button className="camera-toggle" onClick={() => onToggle(camera.id)}>{camera.active ? 'Disable camera' : 'Enable camera'}</button>
+      <div className="video-label">{camera.local ? 'You' : 'Remote doctor'} · {camera.name}</div>
+    </div>
+  );
 }
 
 function RoomParticipant({ initials, name, role, color, you }) {

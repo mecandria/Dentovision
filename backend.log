@@ -1,48 +1,21 @@
-INFO:     Started server process [43900]
+INFO:     Started server process [61523]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     152.57.81.167:0 - "POST /api/login HTTP/1.1" 200 OK
-INFO:     152.57.81.167:0 - "GET /video_feed/0 HTTP/1.1" 200 OK
-[ WARN:0@27.980] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video0): can't open camera by index
-[ WARN:0@27.988] global cap.cpp:475 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
-[ WARN:0@27.989] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video0): can't open camera by index
-[ WARN:0@27.998] global cap_ffmpeg_impl.hpp:1246 open VIDEOIO/FFMPEG: OpenCV should be configured with libavdevice to open a camera device
-INFO:     152.57.81.167:0 - "GET /video_feed/2 HTTP/1.1" 200 OK
-[ WARN:1@28.013] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video2): can't open camera by index
-[ WARN:1@28.013] global cap.cpp:475 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
-[ WARN:1@28.013] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video2): can't open camera by index
-INFO:     152.57.81.167:0 - "GET /video_feed/1 HTTP/1.1" 200 OK
-[ WARN:1@28.091] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video1): can't open camera by index
-[ WARN:1@28.091] global cap.cpp:475 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
-[ WARN:1@28.091] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video1): can't open camera by index
-INFO:     152.57.81.167:0 - "WebSocket /ws/signaling" [accepted]
-INFO:     connection open
 INFO:     106.222.221.41:0 - "POST /api/login HTTP/1.1" 200 OK
-INFO:     106.222.221.41:0 - "GET /video_feed/2 HTTP/1.1" 200 OK
-[ WARN:1@143.049] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video2): can't open camera by index
-[ WARN:1@143.051] global cap.cpp:475 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
-[ WARN:1@143.051] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video2): can't open camera by index
-INFO:     106.222.221.41:0 - "GET /video_feed/0 HTTP/1.1" 200 OK
-[ WARN:1@143.215] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video0): can't open camera by index
-[ WARN:1@143.215] global cap.cpp:475 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
-[ WARN:1@143.215] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video0): can't open camera by index
-INFO:     106.222.221.41:0 - "GET /video_feed/1 HTTP/1.1" 200 OK
-[ WARN:1@143.222] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video1): can't open camera by index
-[ WARN:1@143.222] global cap.cpp:475 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
-[ WARN:1@143.223] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video1): can't open camera by index
 INFO:     106.222.221.41:0 - "WebSocket /ws/signaling" [accepted]
 INFO:     connection open
-INFO:     152.57.81.167:0 - "POST /api/login HTTP/1.1" 200 OK
-INFO:     152.57.81.167:0 - "WebSocket /ws/signaling" [accepted]
-INFO:     connection open
-INFO:     152.57.81.167:0 - "POST /api/login HTTP/1.1" 200 OK
-INFO:     152.57.81.167:0 - "WebSocket /ws/signaling" [accepted]
+INFO:     157.51.81.149:0 - "POST /api/login HTTP/1.1" 200 OK
+INFO:     157.51.81.149:0 - "WebSocket /ws/signaling" [accepted]
 INFO:     connection open
 INFO:     106.222.221.41:0 - "POST /api/login HTTP/1.1" 200 OK
 INFO:     106.222.221.41:0 - "WebSocket /ws/signaling" [accepted]
 INFO:     connection open
-INFO:     Shutting down
-INFO:     Waiting for application shutdown.
-INFO:     Application shutdown complete.
-INFO:     Finished server process [43900]
+INFO:     157.51.24.47:0 - "POST /api/login HTTP/1.1" 200 OK
+INFO:     157.51.24.47:0 - "WebSocket /ws/signaling" [accepted]
+INFO:     connection open
+INFO:     106.222.221.41:0 - "POST /api/login HTTP/1.1" 200 OK
+INFO:     106.222.221.41:0 - "WebSocket /ws/signaling" [accepted]
+INFO:     connection open
+INFO:     106.222.221.41:0 - "WebSocket /ws/signaling" [accepted]
+INFO:     connection open
